@@ -24,6 +24,24 @@ import jax.numpy as jnp
 import numpy as np
 
 
+class _FakeParam:
+
+  def __init__(self, mesh):
+    self.sharding = type('FakeSharding', (), {'mesh': mesh})()
+
+
+class _FakeCacheConfig:
+
+  def cache_partition_spec(self, mesh):
+    del mesh
+
+
+class _FakeCacheModel:
+
+  def __init__(self):
+    self.config = _FakeCacheConfig()
+
+
 def test_prefill():
 
   tokenizer = gm.testing.DummyTokenizer()
@@ -266,3 +284,15 @@ def test_local_window_prefill_scratch_restages_previous_cache():
       [-(10**9), -(10**9), -(10**9), -(10**9), -(10**9),
        1, 2, 3, -(10**9), -(10**9)],
   )
+
+
+def test_cache_mesh_from_params_uses_first_param_mesh():
+  mesh = object()
+  model = _FakeCacheModel()
+
+  cache_mesh = _prefill._cache_mesh_from_params(
+      model=model,
+      params={'params': _FakeParam(mesh)},
+  )
+
+  assert cache_mesh is mesh

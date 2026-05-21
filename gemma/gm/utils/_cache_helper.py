@@ -23,6 +23,7 @@ import os
 from etils import epy
 import flax
 from gemma.gm.nn import _config
+import jax
 import jax.numpy as jnp
 from kauldron.ktyping import Bool, Int  # pylint: disable=g-multiple-import
 
@@ -99,6 +100,17 @@ def is_local_window_layer(layer_data: dict) -> bool:
   the cache pytree itself stays self-describing.
   """
   return 'logical_index' in layer_data and 'valid' in layer_data
+
+
+def mesh_from_params(params):
+  """Infer the active mesh from the first parameter leaf's sharding."""
+  if params is None:
+    return None
+  leaves = jax.tree.leaves(params)
+  if not leaves:
+    return None
+  sharding = getattr(leaves[0], 'sharding', None)
+  return getattr(sharding, 'mesh', None)
 
 
 @flax.struct.dataclass

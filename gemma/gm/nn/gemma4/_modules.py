@@ -35,6 +35,13 @@ DEFAULT_ROPE_SCALE_FACTOR = 1.0
 LayerCache = dict[str, jax.Array]
 
 
+def _with_reference_sharding(value: jax.Array, reference: jax.Array):
+  sharding = getattr(reference, 'sharding', None)
+  if sharding is None:
+    return value
+  return kd.sharding.with_sharding_constraint(value, sharding)
+
+
 def _create_sliding_mask(
     positions: Int['B L'],
     *,
@@ -329,13 +336,19 @@ class Attention(nn.Module):
 
       # [batch_size, cache_size, num_heads, key_size]
       value_proj = cache['v'].at[batch_indices, indices].set(value_proj)
+      value_proj = _with_reference_sharding(value_proj, cache['v'])
 
       # [batch_size, cache_size, num_heads, key_size]
       key_proj = cache['k'].at[batch_indices, indices].set(key_proj)
+      key_proj = _with_reference_sharding(key_proj, cache['k'])
 
       # [batch_size, cache_size]
       cache_positions = (
           cache['positions'].at[batch_indices, indices].set(segment_pos)
+      )
+      cache_positions = _with_reference_sharding(
+          cache_positions,
+          cache['positions'],
       )
 
       # LOCAL_WINDOW ring-buffer metadata maintenance. The logical index is
@@ -359,11 +372,16 @@ class Attention(nn.Module):
                 logical_write_valid, logical_indices, old_logical_index
             ))
         )
+        cache_logical_index = _with_reference_sharding(
+            cache_logical_index,
+            cache['logical_index'],
+        )
         cache_valid = (
             cache['valid']
             .at[batch_indices, indices]
             .set(jnp.where(logical_write_valid, True, old_valid))
         )
+        cache_valid = _with_reference_sharding(cache_valid, cache['valid'])
     else:
       cache_positions = None
 
@@ -453,7 +471,10 @@ class Attention(nn.Module):
     if cache is not None:
       seq_len = x.shape[1]
       # [batch_size]
-      new_cache['end_index'] = cache['end_index'] + seq_len
+      new_cache['end_index'] = _with_reference_sharding(
+          cache['end_index'] + seq_len,
+          cache['end_index'],
+      )
       assert (
           cache_positions is not None
       ), 'cache_positions should not be None when cache is not None'

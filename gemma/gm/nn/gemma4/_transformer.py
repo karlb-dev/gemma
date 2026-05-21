@@ -395,6 +395,7 @@ class Transformer(nn.Module):
           'dtype',
           'cache_length',
           'sharding',
+          'mesh',
           'kv_cache_mode',
       ),
   )
@@ -405,6 +406,8 @@ class Transformer(nn.Module):
       dtype: jnp.dtype[Any],
       cache_length: int,
       sharding: kd.sharding.ShardingTree | None = None,
+      mesh: Any | None = None,
+      params: Any | None = None,
       kv_cache_mode: _cache_helper.KVCacheMode = (
           _cache_helper.KVCacheMode.LEGACY
       ),
@@ -415,6 +418,14 @@ class Transformer(nn.Module):
         cache_length=cache_length,
         kv_cache_mode=kv_cache_mode,
     )
+    if sharding is None:
+      if mesh is None:
+        mesh = _cache_helper.mesh_from_params(params)
+      if mesh is not None:
+        sharding = self.config.cache_partition_spec(
+            mesh,
+            kv_cache_mode=kv_cache_mode,
+        )
     return kd.sharding.with_sharding_constraint(cache, sharding)
 
   def _encode_and_get_inputs(
