@@ -29,6 +29,20 @@ BATCH_SIZE = 4
 SEQ_LEN = 16
 
 
+class _FakeMesh:
+
+  def __init__(self, shape):
+    self.shape = shape
+    self.axis_names = tuple(shape)
+
+
+class _FakeNamedSharding:
+
+  def __init__(self, mesh, spec):
+    self.mesh = mesh
+    self.spec = spec
+
+
 def _get_output(
     model: gt.Transformer, **kwargs
 ) -> tuple[gt.Output, Any]:
@@ -152,3 +166,124 @@ def test_init_cache_local_window_does_not_shrink_global_without_global_key():
 
   assert cache['layer_0']['k'].shape == (1, 10, 1, 4)
   assert 'logical_index' not in cache['layer_0']
+
+
+def test_cache_partition_spec_shards_divisible_kv_heads(monkeypatch):
+  monkeypatch.setattr(_config, 'NamedSharding', _FakeNamedSharding)
+  config = _config.TransformerConfig(
+      num_embed=32,
+      embed_dim=8,
+      hidden_dim=16,
+      num_heads=4,
+      head_dim=4,
+      num_kv_heads=2,
+      final_logit_softcap=None,
+      use_post_attn_norm=False,
+      use_post_ffw_norm=False,
+      attention_types=(
+          _modules.AttentionType.LOCAL_SLIDING,
+          _modules.AttentionType.GLOBAL,
+      ),
+      sliding_window_size=4,
+      global_key_size=6,
+      num_global_kv_heads=4,
+  )
+
+  spec = config.cache_partition_spec(_FakeMesh({'replicate': 2, 'tensor': 2}))
+
+  assert tuple(spec['layer_0']['k'].spec) == (None, None, 'tensor', None)
+  assert tuple(spec['layer_0']['v'].spec) == (None, None, 'tensor', None)
+  assert tuple(spec['layer_0']['positions'].spec) == ()
+  assert tuple(spec['layer_0']['end_index'].spec) == ()
+  assert tuple(spec['layer_1']['k'].spec) == (None, None, 'tensor', None)
+
+
+def test_cache_partition_spec_replicates_nondivisible_e2b(monkeypatch):
+  monkeypatch.setattr(_config, 'NamedSharding', _FakeNamedSharding)
+  config = _config.TransformerConfig(
+      num_embed=32,
+      embed_dim=8,
+      hidden_dim=16,
+      num_heads=2,
+      head_dim=4,
+      num_kv_heads=1,
+      final_logit_softcap=None,
+      use_post_attn_norm=False,
+      use_post_ffw_norm=False,
+      attention_types=(_modules.AttentionType.LOCAL_SLIDING,),
+      sliding_window_size=4,
+  )
+
+  spec = config.cache_partition_spec(_FakeMesh({'replicate': 2, 'tensor': 2}))
+
+  assert tuple(spec['layer_0']['k'].spec) == ()
+  assert tuple(spec['layer_0']['v'].spec) == ()
+
+
+def test_e4b_tp2_cache_partition_specs_shard_all_kv(monkeypatch):
+  monkeypatch.setattr(_config, 'NamedSharding', _FakeNamedSharding)
+  model = gemma4_models.Gemma4_E4B()  # pylint: disable=missing-kwoa  # pytype: disable=missing-parameter
+  config = model.config
+
+  spec = config.cache_partition_spec(_FakeMesh({'replicate': 2, 'tensor': 2}))
+
+  kv_specs = {
+      tuple(layer_spec[name].spec)
+      for layer_spec in spec.values()
+      for name in ('k', 'v')
+  }
+  assert kv_specs == {(None, None, 'tensor', None)}
+
+
+def test_cache_partition_spec_replicates_without_tensor_axis(monkeypatch):
+  monkeypatch.setattr(_config, 'NamedSharding', _FakeNamedSharding)
+  config = _config.TransformerConfig(
+      num_embed=32,
+      embed_dim=8,
+      hidden_dim=16,
+      num_heads=4,
+      head_dim=4,
+      num_kv_heads=4,
+      final_logit_softcap=None,
+      use_post_attn_norm=False,
+      use_post_ffw_norm=False,
+      attention_types=(_modules.AttentionType.GLOBAL,),
+  )
+
+  spec = config.cache_partition_spec(_FakeMesh({'fsdp': 4}))
+
+  assert tuple(spec['layer_0']['k'].spec) == ()
+  assert tuple(spec['layer_0']['v'].spec) == ()
+
+
+def test_cache_partition_spec_matches_local_window_tree(monkeypatch):
+  monkeypatch.setattr(_config, 'NamedSharding', _FakeNamedSharding)
+  config = _config.TransformerConfig(
+      num_embed=32,
+      embed_dim=8,
+      hidden_dim=16,
+      num_heads=2,
+      head_dim=4,
+      num_kv_heads=2,
+      final_logit_softcap=None,
+      use_post_attn_norm=False,
+      use_post_ffw_norm=False,
+      attention_types=(
+          _modules.AttentionType.LOCAL_SLIDING,
+          _modules.AttentionType.GLOBAL,
+      ),
+      sliding_window_size=4,
+  )
+
+  legacy = config.cache_partition_spec(_FakeMesh({'tensor': 2}))
+  local_window = config.cache_partition_spec(
+      _FakeMesh({'tensor': 2}),
+      kv_cache_mode=_cache_helper.KVCacheMode.LOCAL_WINDOW,
+  )
+
+  assert 'logical_index' not in legacy['layer_0']
+  assert 'valid' not in legacy['layer_0']
+  assert tuple(local_window['layer_0']['logical_index'].spec) == ()
+  assert tuple(local_window['layer_0']['valid'].spec) == ()
+  assert 'logical_index' not in local_window['layer_1']
+  assert 'valid' not in local_window['layer_1']

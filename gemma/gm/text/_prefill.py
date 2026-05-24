@@ -344,6 +344,9 @@ def _get_or_init_cache(
   """Initialize or reuse the cache."""
 
   if not prev_turns:
+    cache_mesh = None
+    if sharding is None:
+      cache_mesh = _cache_mesh_from_params(model=model, params=params)
     init_kwargs = {
         'batch_size': inputs.batch_size,
         'dtype': _dtype(params),
@@ -354,6 +357,8 @@ def _get_or_init_cache(
     # Older transformer .init_cache signatures will reject the kwarg.
     if kv_cache_mode != _cache_helper.KVCacheMode.LEGACY:
       init_kwargs['kv_cache_mode'] = kv_cache_mode
+    if cache_mesh is not None:
+      init_kwargs['mesh'] = cache_mesh
     cache = model.init_cache(**init_kwargs)
   else:
     # TODO(epot): Should check shape is compatible with `cache_length`.
@@ -362,6 +367,17 @@ def _get_or_init_cache(
   # Wrap cache to help resizing.
   cache = _cache_helper.Cache(cache)
   return cache
+
+
+def _cache_mesh_from_params(
+    *,
+    model: _transformer_like.TransformerLike,
+    params: _common.Params,
+):
+  """Return the params mesh when the model exposes cache sharding."""
+  if not hasattr(model.config, 'cache_partition_spec'):
+    return None
+  return _cache_helper.mesh_from_params(params)
 
 
 def _make_prefill_input(
