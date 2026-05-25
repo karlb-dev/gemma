@@ -31,6 +31,7 @@ from gemma.gm.ckpts import _compat
 from gemma.gm.ckpts import _quantization
 from gemma.gm.typing._common import Params  # pylint: disable=g-importing-member
 import jax
+import jax.numpy as jnp
 from kauldron import kd
 import numpy as np
 from orbax import checkpoint as ocp
@@ -61,10 +62,14 @@ class LoadCheckpoint(kd.ckpts.InitTransform):
 
   path: epath.PathLike
   quantize: bool = False
+  dtype: Any | None = None
 
   def transform(self, state: _StateT) -> _StateT:  # pytype: disable=signature-mismatch
     new_params = load_params(
-        self.path, params=state.params, quantize=self.quantize
+        self.path,
+        params=state.params,
+        quantize=self.quantize,
+        dtype=self.dtype,
     )
     return dataclasses.replace(state, params=new_params)
 
@@ -205,6 +210,7 @@ def load_params(
     text_only: bool = False,
     sharding: kd.sharding.ShardingTree | None = None,
     quantize: bool = False,
+    dtype: Any | None = None,
 ) -> Params:
   """Restore the params from a checkpoint.
 
@@ -220,6 +226,10 @@ def load_params(
       is mutually exclusive with `params`.
     quantize: If `True`, the params will be mapped to enable quantization aware
       training.
+    dtype: Optional floating-point restore dtype. When set, floating checkpoint
+      leaves are restored into this dtype while integer / bool leaves keep their
+      checkpoint dtype. This is useful for large inference checkpoints whose
+      metadata is fp32 but whose matmuls run in bf16.
 
   Returns:
     The restored params.
@@ -232,6 +242,8 @@ def load_params(
   metadata, path = _get_metadata_and_path(ckpt, path)
 
   metadata = _CheckpointTree.shape_dtype_struct_like(tree=metadata)
+  if dtype is not None:
+    metadata = _cast_floating_restore_dtype(metadata, dtype)
 
   # Eventually clear up the memory.
   if donate and params is not None:
@@ -320,6 +332,23 @@ def load_params(
           output.tree['embedder']['mm_soft_embedding_norm'],
       )
   return tree
+
+
+def _cast_floating_restore_dtype(
+    metadata: _CheckpointTree,
+    dtype: Any,
+) -> _CheckpointTree:
+  """Return metadata with floating leaves retargeted to `dtype`."""
+  dtype = jnp.dtype(dtype)
+
+  def cast_leaf(x):
+    if not isinstance(x, jax.ShapeDtypeStruct):
+      return x
+    if not jnp.issubdtype(x.dtype, jnp.floating):
+      return x
+    return x.update(dtype=dtype)
+
+  return _CheckpointTree(tree=jax.tree.map(cast_leaf, metadata.tree))
 
 
 # ======================== Structure reformat utils ========================
