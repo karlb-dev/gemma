@@ -17,13 +17,17 @@
 from collections.abc import Sequence
 import dataclasses
 import functools
+from typing import Any
 
 from gemma.gm.nn.gemma4 import _modules
 from gemma.gm.nn.gemma4.audio import _modules as gemma4_audio
 from gemma.gm.nn.gemma4.vision import _encoder as gemma4_vision
 from gemma.gm.text import _tokenizer
+from gemma.gm.utils import _cache_helper
 from gemma.gm.utils import _types
 import jax.numpy as jnp
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
 
 Cache = dict[str, _modules.LayerCache]
@@ -160,13 +164,44 @@ class TransformerConfig:
       dtype: jnp.dtype = jnp.bfloat16,
       *,
       cache_length: int,
+      kv_cache_mode: _cache_helper.KVCacheMode = (
+          _cache_helper.KVCacheMode.LEGACY
+      ),
   ) -> Cache:
-    """Initializes a new Transformer cache."""
+    """Initializes a new Transformer cache.
+
+    Args:
+      batch_size: cache batch size.
+      dtype: dtype for K/V buffers.
+      cache_length: full logical cache length (used for global layers; also
+        the upper bound for local-window layers).
+      kv_cache_mode: KV cache allocation policy.
+        - LEGACY: every layer gets `[B, cache_length, ...]` (default).
+        - LOCAL_WINDOW: LOCAL_SLIDING layers are sized to
+          `min(cache_length, sliding_window_size)` slots and carry ring-buffer
+          metadata (`logical_index`, `valid`); GLOBAL layers stay at
+          `cache_length`. Saves a large fraction of HBM at long context.
+    """
     if cache_length is None:
       raise ValueError(
           'Missing `cache_length=` kwarg when calling `init_cache()`.'
       )
     cache: Cache = {}
+
+    use_local_window = (
+        kv_cache_mode == _cache_helper.KVCacheMode.LOCAL_WINDOW
+        and self.sliding_window_size is not None
+    )
+    # Per the design review: persistent local cache is exactly the sliding
+    # window size, NOT window+1. The sliding mask is strict-bounded
+    # (cache_position > pos - W and cache_position < pos + W), so for causal
+    # decode the cache must hold the current token plus the previous W-1, i.e.
+    # W slots total.
+    local_window_size = (
+        min(cache_length, self.sliding_window_size)
+        if use_local_window
+        else cache_length
+    )
 
     for i, attn_type in enumerate(self.attention_types):
       if (
@@ -182,6 +217,23 @@ class TransformerConfig:
             batch_size,
             dtype,
         )
+      elif attn_type == _modules.AttentionType.LOCAL_SLIDING:
+        if use_local_window:
+          cache[f'layer_{i}'] = _modules.Attention.init_local_window_cache(
+              local_window_size,
+              self.num_kv_heads,
+              self.head_dim,
+              batch_size,
+              dtype,
+          )
+        else:
+          cache[f'layer_{i}'] = _modules.Attention.init_cache(
+              cache_length,
+              self.num_kv_heads,
+              self.head_dim,
+              batch_size,
+              dtype,
+          )
       else:
         cache[f'layer_{i}'] = _modules.Attention.init_cache(
             cache_length,
@@ -191,3 +243,67 @@ class TransformerConfig:
             dtype,
         )
     return cache
+
+  def cache_partition_spec(
+      self,
+      mesh,
+      *,
+      tp_axis: str = 'tensor',
+      kv_cache_mode: _cache_helper.KVCacheMode = (
+          _cache_helper.KVCacheMode.LEGACY
+      ),
+  ) -> dict[str, dict[str, Any]]:
+    """Return a sharding tree for this model's KV cache.
+
+    K/V buffers are sharded across the configured tensor-parallel axis when
+    the layer's KV-head count divides evenly by that axis size. Cache metadata
+    is always replicated. If the mesh does not expose `tp_axis`, the whole
+    cache falls back to replication.
+    """
+    axis_names = getattr(mesh, 'axis_names', ())
+    tp_size = None
+    if tp_axis in axis_names:
+      try:
+        tp_size = int(mesh.shape[tp_axis])
+      except (KeyError, TypeError, ValueError):
+        tp_size = None
+
+    replicated = NamedSharding(mesh, P())
+
+    def kv_sharding(num_heads: int):
+      if tp_size is not None and num_heads % tp_size == 0:
+        return NamedSharding(mesh, P(None, None, tp_axis, None))
+      return replicated
+
+    use_local_window = (
+        kv_cache_mode == _cache_helper.KVCacheMode.LOCAL_WINDOW
+        and self.sliding_window_size is not None
+    )
+    spec_tree = {}
+    for i, attn_type in enumerate(self.attention_types):
+      if (
+          attn_type == _modules.AttentionType.GLOBAL
+          and self.global_key_size is not None
+      ):
+        heads = (
+            self.num_global_kv_heads
+            if self.num_global_kv_heads
+            else self.num_kv_heads
+        )
+      else:
+        heads = self.num_kv_heads
+
+      layer_spec = {
+          'k': kv_sharding(heads),
+          'v': kv_sharding(heads),
+          'positions': replicated,
+          'end_index': replicated,
+      }
+      if (
+          use_local_window
+          and attn_type == _modules.AttentionType.LOCAL_SLIDING
+      ):
+        layer_spec['logical_index'] = replicated
+        layer_spec['valid'] = replicated
+      spec_tree[f'layer_{i}'] = layer_spec
+    return spec_tree
