@@ -1,800 +1,659 @@
-# Gemma JAX KV Cache: Memory & Sharding Design Proposal
+# Gemma 4 Local-Window KV Cache
 
-**Author:** Karl (with Claude Code assistance)
-**Status:** Updated after design review
-**Target:** `github.com/google-deepmind/gemma` (this repo)
-**Date:** 2026-05-09
-**Related code paths:**
-- [`gemma/gm/text/_sampler.py`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/text/_sampler.py)
-- [`gemma/gm/text/_chat_sampler.py`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/text/_chat_sampler.py)
-- [`gemma/gm/text/_gemma4_sampler.py`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/text/_gemma4_sampler.py)
-- [`gemma/gm/text/_prefill.py`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/text/_prefill.py)
-- [`gemma/gm/text/_sampler_loop.py`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/text/_sampler_loop.py)
-- [`gemma/gm/nn/gemma4/_config.py`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/nn/gemma4/_config.py)
-- [`gemma/gm/nn/gemma4/_modules.py`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/nn/gemma4/_modules.py)
-- [`gemma/gm/nn/gemma4/_transformer.py`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/nn/gemma4/_transformer.py)
-- [`gemma/gm/utils/_cache_helper.py`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/utils/_cache_helper.py)
+**Author:** Karl Burtram <kburtram@live.com>
+**Status:** Code review for the change on this branch
+**Target:** `github.com/google-deepmind/gemma`
+**Date:** 2026-05-27
+
+This document describes the change on this branch. It is not a proposal —
+the code is here, the tests are here, and the measurements come from
+runs against this branch on TPU v5e-4, v5e-8, and v5e-16 hardware. The
+goal is to give a reviewer enough detail to make a decision: what the
+change does, how it is gated, what it costs, where it has been
+validated, and where it has not.
 
 ---
 
-## 1. Problem Statement
+## 1. Summary
 
-The `gm.text.ChatSampler` / `gm.text.Gemma4Sampler` inference path is
-substantially less HBM-efficient than necessary on multi-chip TPU slices,
-specifically for the Gemma 4 model family which uses hybrid
-local-sliding + global attention. Two independent issues compound:
+This branch adds an opt-in KV-cache layout for Gemma 4
+(`KVCacheMode.LOCAL_WINDOW`) that caps each `LOCAL_SLIDING` attention
+layer's persistent decode cache at `sliding_window_size` slots in a
+per-row ring buffer, while keeping `GLOBAL` layers at the full
+`cache_length`. The default behavior is unchanged: `KVCacheMode.LEGACY`
+is the default at every call site, so existing users see the same
+allocation, the same shapes, and the same sampler-loop semantics as
+before.
 
-**Problem A — Eager, uniform cache allocation across all layers.**
-At sampler construction time (more precisely at the start of every
-non-multi-turn prefill call), the cache is allocated as a fixed
-`[batch, cache_length, num_kv_heads, head_dim]` buffer **identically
-sized on every layer**, including layers whose attention type is
-`LOCAL_SLIDING` and which only ever read the most recent
-`sliding_window_size` tokens during causal decode
-([`gemma4/_modules.py:343-349`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/nn/gemma4/_modules.py#L343-L349)
-masks all positions outside the window). For a Gemma 4 model that uses a
-5L:1G pattern (E4B has 35 local + 7 global; 31B has 50 local + 10 global;
-26B-A4B has 25 local + 5 global), most of the per-layer cache budget is
-zeroed bytes that the attention mask discards. The waste fraction grows
-linearly with `cache_length` until at long contexts the cache is
-dominated by guaranteed-unread bytes.
+The change is local: ~30 LOC in `gemma4/_config.py` decide cache shapes;
+~110 LOC of new code in `gemma4/_modules.py` implement the ring-buffer
+write and the logical-mask gather; ~300 LOC in `_prefill.py` implement
+the scratch-then-compact prefill flow that keeps prefill attention
+numerics identical to the legacy path. The remaining files are small
+adjustments: a uniform-layer-shape assumption in `_cache_helper.py`
+becomes a `max()` across layers; the sampler loop's stop condition
+switches from layer-0 physical shape to the logical `cache_length`.
 
-**Problem B — Cache is replicated across the device slice.**
-At all current call sites
-([`gemma4/_transformer.py:412`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/nn/gemma4/_transformer.py#L412),
-[`_transformer.py:329`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/nn/_transformer.py#L329),
-[`gemma3n/_transformer.py:370`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/nn/gemma3n/_transformer.py#L370))
-the cache pytree is passed to
-`kd.sharding.with_sharding_constraint(cache, sharding)` with no
-intrinsic, model-aware partition spec. The user-facing samplers
-(`Sampler`, `Gemma4Sampler`, `ChatSampler`) accept a `sharding=` kwarg
-but the documented usage path
-([`colabs/sharding.ipynb`](https://github.com/google-deepmind/gemma/blob/main/colabs/sharding.ipynb))
-does not pass one. With `sharding=None` the constraint is a no-op and
-the cache lives wherever the active mesh / JIT default puts it. With
-FSDP-sharded params and no explicit cache sharding, the cache gets
-**replicated across every chip** — same memory cost on every chip in
-the slice, scaling 1× rather than 1/N×.
+Measured on TPU v5e at batch=1, single-turn decode:
 
-The combination is a multiplicative loss: every chip pays for cache
-slots that are never read. On memory-constrained slices (16 GB / chip
-on TPU v5e) it is the dominant blocker for running the larger Gemma 4
-variants (31B, 26B-A4B) at any usable context length, and a soft
-blocker for E2B/E4B at long contexts (≥16K).
+- The local-window fork scales the largest reliable application context
+  with the slice size: $8$k on v5e-4 (unchanged from stock), $32$k on
+  v5e-8, and $64$k on v5e-16. Stock serving caps at $8$k on v5e-4 and
+  $16$k on both v5e-8 and v5e-16 — adding chips buys parameter
+  headroom but no cache headroom under stock.
+- At the clean serving cell (v5e-4, $L{=}8192$, $B{=}1$, $N{=}21$
+  cases), both modes serve every case. The fork pays $1.22$ GiB of
+  per-chip HBM headroom for $275$ ms of additional prefill
+  ($+19\%$ on `service_p50`). Per-token decode is $12\%$ faster under
+  the fork ($0.100$ vs $0.114$ ms) because the logical-mask gather
+  attends a shorter physical span.
+- Across the v5e-4 long-context grid ($L \ge 16{,}384$), stock
+  saturates the per-chip HBM cap ($\approx 15.73$ GiB) while the fork
+  keeps $1.5$–$3.7$ GiB of headroom. The fork's wall-clock cost in
+  this regime is $19$–$32\%$ on `service_p50`, essentially all in
+  prefill ring-buffer compaction.
 
-### 1.1. Empirical evidence
-
-Two scripts ([`examples/cache_audit.py`](./examples/cache_audit.py) and
-[`examples/cache_probe.py`](./examples/cache_probe.py), included in
-this proposal) collect the following data on a v5e-4 slice (4 chips,
-16 GB HBM each, FSDP-sharded params):
-
-**Cache audit, Gemma4_E4B (35 LOCAL_SLIDING + 7 GLOBAL layers,
-`num_kv_heads=2`, `head_dim=256` local / 512 global,
-`sliding_window_size=512`):**
-
-| `cache_length` | Total cache bytes | LOCAL bytes | GLOBAL bytes | Ratio vs L=256 |
-|---:|---:|---:|---:|---:|
-|   256 |   24.54 MiB |  17.53 MiB |   7.01 MiB | 1.00× |
-| 4 096 |  392.66 MiB | 280.55 MiB | 112.11 MiB | 16.00× |
-|16 384 | 1 506.11 MiB | 1 100 MiB | 448 MiB | 64.00× |
-
-The ratio is **exactly linear in `cache_length` across every layer**,
-including all 35 local-sliding layers. With a `sliding_window_size=512`,
-the local layers only ever read `<= 512` slots; at `cache_length=16384`
-the local-attention storage is **31× over-allocated per local layer**
-(15 872 unread slots for every 512 read).
-
-**Runtime probe, Gemma4_E4B, ChatSampler with FSDP-sharded params,
-single chat() turn (~25 output tokens):**
-
-| Metric | L=4 096 | L=16 384 |
-|---|---:|---:|
-| HBM after params load (per chip) | 7.81 GiB | 7.81 GiB |
-| Peak HBM during chat (chip 0) | 9.46 GiB | 14.04 GiB |
-| Peak HBM during chat (chips 1-3) | 9.37 GiB | 13.95 GiB |
-| **Per-chip peak Δ** | **+1.6 GiB** | **+6.2 GiB** |
-| Per-chip post-chat Δ (steady state) | +800 MiB | +3.08 GiB |
-
-Interpretation:
-
-1. The peak deltas are roughly equal across all 4 chips (chip 0 is only
-   ~90 MiB above the others). This **confirms Problem B with replication
-   semantics**: every chip absorbs the full cache cost.
-2. The post-chat steady-state delta of ~800 MiB at L=4096 is roughly
-   **2× the logical cache size** (392 MiB). The extra ~400 MiB is the
-   `last_state.cache` held by `ChatSampler` plus a transient second
-   copy created by the functional update in `_merge_cache`
-   ([`_prefill.py:357-366`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/text/_prefill.py#L357-L366)).
-3. At L=16384 the per-chip peak exceeds 14 GiB out of a 15.75 GiB chip
-   limit. With ~6 GiB of headroom for activations/intermediate buffers
-   already consumed, this is the regime where small jit-time
-   re-allocations OOM — matching the originally reported
-   "32 MB allocation fails with chip 0 at near-zero free" symptom on
-   the bigger models (31B / 26B-A4B).
-
-### 1.2. Why this matters for production-style usage on TPU v5e
-
-The repo's stated audience for this sampler is research/experimentation
-([`gm.text.Sampler` docstring](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/text/_sampler.py#L86)
-explicitly recommends `gm.text.ChatSampler` "for most use cases"). But
-the sampler is the only ergonomic in-repo path to evaluate Gemma 4 on a
-TPU slice without standing up a separate inference engine. Closing
-even half the gap between the current implementation and a
-production-quality KV cache layout (à la MaxText / JetStream) makes
-the official sampler a viable evaluation tool for the larger Gemma 4
-variants on commodity TPU slices.
-
-### 1.3. Out of scope
-
-The following are intentionally NOT in scope for this proposal:
-
-- **PagedAttention / vLLM-style block-table caches.** Significant
-  surgery (block tables, Pallas gather kernels, ragged attention math).
-  Only a clear win for batched, multi-tenant serving with
-  heterogeneous request lengths. For a research sampler with batch=1
-  the eager-buffer approach is fine *once* Problems A and B are fixed.
-- **Quantized KV cache** (int8 / fp8). Independent axis of
-  improvement; can be layered on top of either fix.
-- **Cross-sampler refactor** (unifying `Sampler` / `Gemma4Sampler` /
-  `ChatSampler`). This proposal touches their shared dependencies but
-  preserves their public interfaces.
+The trade is: pay a measurable prefill cost to make long context
+serviceable. The net is positive past the point where stock stops
+serving, and a small but real cost at shorter contexts. The mode is
+opt-in for that reason.
 
 ---
 
-## 2. Code Archaeology
+## 2. Background
 
-### 2.1. Cache data structure
+### 2.1 The over-allocation
 
-The cache is a **plain `dict[str, dict[str, jax.Array]]`** keyed by
-`f"layer_{i}"`, with no axis-aware annotations:
+Gemma 4 uses a hybrid attention pattern: every Nth layer is `GLOBAL`,
+and the rest are `LOCAL_SLIDING` with a fixed `sliding_window_size`. For
+the published Gemma 4 variants:
 
-```
-type alias:  Cache = dict[str, _modules.LayerCache]
-type alias:  LayerCache = dict[str, jax.Array]
-```
+| Model     | Local | Global | Window |
+|-----------|-------|--------|--------|
+| E4B       | 35    | 7      | 512    |
+| 26B (MoE) | 25    | 5      | 1024   |
+| 31B dense | 50    | 10     | 1024   |
 
-Defined at
-[`gemma/gm/nn/_config.py:28`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/nn/_config.py#L28)
-(legacy) and
-[`gemma/gm/nn/gemma4/_config.py:29`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/nn/gemma4/_config.py#L29)
-(Gemma 4). Per layer, four arrays:
+The sampler at
+[`gemma/gm/text/_sampler.py`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/text/_sampler.py)
+and the model's `init_cache` at
+[`gemma/gm/nn/gemma4/_config.py`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/nn/gemma4/_config.py)
+allocate a `[batch, cache_length, num_kv_heads, head_dim]` buffer per
+attention layer regardless of attention type. The sliding-window mask
+at
+[`gemma4/_modules.py`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/nn/gemma4/_modules.py)
+already discards every slot outside the window, so on a local-sliding
+layer at $L{=}16{,}384$, the persistent storage carries $512$ slots that
+the attention mask can read and $15{,}872$ slots that it cannot. The
+ratio of unread to read storage per local layer is $L/W - 1$; at
+$L{=}16{,}384, W{=}512$ that is $31{\times}$.
 
-| Field | Shape | Dtype | Role |
-|---|---|---|---|
-| `'k'` | `[B, cache_size, num_kv_heads, head_dim]` | bf16 | key cache |
-| `'v'` | `[B, cache_size, num_kv_heads, head_dim]` | bf16 | value cache |
-| `'positions'` | `[B, cache_size]` | int32 | per-slot RoPE position (used by sliding mask) |
-| `'end_index'` | `[B]` | int32 | write pointer (mod cache_size) |
+![Gemma 4 E4B attention layer pattern. The 42-layer model decomposes
+into 7 repeats of (5 local + 1 global). The local-window fork caps each
+local layer's persistent decode cache at min(L, 512) slots in a ring
+buffer; the 7 global layers retain full-length
+storage.](docs/figures/gemma_attention_layers.png)
 
-A thin slicing wrapper exists
-([`_cache_helper.Cache`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/utils/_cache_helper.py#L31-L89))
-but it just wraps the dict — it doesn't change the underlying layout.
+### 2.2 Slot math
 
-### 2.2. Allocation and sharding
+In aggregate cache slots, with $L$ the cache length, $W$ the sliding
+window, and Gemma 4 E4B's $35{+}7$ layer split:
 
-**Single-shot allocation per first-turn `sample()` / `chat()` call.**
-The full call chain for Gemma 4:
+$$S_{\text{stock}} = 42L \quad\quad S_{\text{lw}} = 7L + 35\min(L, W)$$
 
-1. User → `Gemma4Sampler.sample()` /
-   `ChatSampler.chat()` ([`_chat_sampler.py:261`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/text/_chat_sampler.py#L261)).
-2. → `_prefill.prefill(... cache_length=self.cache_length, sharding=sharding)` ([`_gemma4_sampler.py:206`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/text/_gemma4_sampler.py#L206)).
-3. → `_get_or_init_cache()` ([`_prefill.py:283-307`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/text/_prefill.py#L283-L307)).
-4. → `model.init_cache(...)` ([`_prefill.py:295-300`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/text/_prefill.py#L295-L300)).
-5. → `Gemma4Transformer.init_cache` ([`gemma4/_transformer.py:399-412`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/nn/gemma4/_transformer.py#L399-L412), `nn.jit`-decorated, static_argnames includes `cache_length`, `sharding`, etc.).
-6. → `TransformerConfig.init_cache` ([`gemma4/_config.py:157-193`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/nn/gemma4/_config.py#L157-L193)).
-7. → `_modules.Attention.init_cache` ([`gemma4/_modules.py:397-417`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/nn/gemma4/_modules.py#L397-L417)) — `jnp.zeros(...)` per layer.
+For E4B with $W{=}512$:
 
-The sharding plumbing is a single
-`kd.sharding.with_sharding_constraint(cache, sharding)` over the entire
-pytree at
-[`gemma4/_transformer.py:412`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/nn/gemma4/_transformer.py#L412):
+| L       | $S_{\text{stock}}$ | $S_{\text{lw}}$ | Reduction |
+|---------|-------------------:|----------------:|----------:|
+| 4 096   | 172 032            | 46 592          | 3.7×      |
+| 8 192   | 344 064            | 75 264          | 4.6×      |
+| 16 384  | 688 128            | 132 608         | 5.2×      |
+| 32 768  | 1 376 256          | 247 296         | 5.6×      |
+| 65 536  | 2 752 512          | 476 672         | 5.8×      |
 
-```python
-return kd.sharding.with_sharding_constraint(cache, sharding)
-```
+The reduction approaches $42/7 = 6{\times}$ asymptotically as $L$ grows
+past the window: in the limit, only the 7 global layers scale with
+$L$.
 
-If the user does not pass a `sharding=` argument (the documented
-pattern), this is a no-op. The cache then takes the JAX default
-placement, which inside an active FSDP mesh is **replicated** (as
-confirmed by the runtime probe).
+This is narrower than a full serving-system memory manager such as
+PagedAttention. It exploits the Gemma-specific local/global split. The
+pattern generalizes to Longformer- and Mistral-style architectures, but
+this change does not attempt that generalization.
 
-**`cache_length` source.** A user-tunable field on the sampler, default
-4096
-([`_sampler.py:137`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/text/_sampler.py#L137),
-[`_gemma4_sampler.py:76`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/text/_gemma4_sampler.py#L76),
-[`_chat_sampler.py:127`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/text/_chat_sampler.py#L127)).
-Used as a single integer argument applied uniformly to every layer in
-[`gemma4/_config.py:171-192`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/nn/gemma4/_config.py#L171-L192).
+---
 
-**Allocation frequency.** Once per first-turn `sample()` / `chat()`. In
-multi-turn mode, the cache is reused across turns
-([`_prefill.py:301-303`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/text/_prefill.py#L301-L303):
-`cache = prev_turns.cache`).
+## 3. Mechanism
 
-### 2.3. The local-sliding waste, exposed
+### 3.1 The cache-mode flag
 
-The structural location of Problem A is
-[`gemma4/_config.py:171-192`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/nn/gemma4/_config.py#L171-L192):
+A new enum, in
+[`gemma/gm/utils/_cache_helper.py`](./gemma/gm/utils/_cache_helper.py):
 
 ```python
+class KVCacheMode(enum.Enum):
+  LEGACY = 'legacy'         # full [B, L, H, D] per layer (default)
+  LOCAL_WINDOW = 'local_window'  # local layers ring-buffered at W
+
+class KVPrefillMode(enum.Enum):
+  LEGACY_SCRATCH = 'legacy_scratch'  # only mode for now
+```
+
+`KVCacheMode.LEGACY` is the default at every call site
+(`Sampler.__init__`, `Gemma4Sampler.__init__`, `ChatSampler.__init__`,
+`Gemma4Transformer.init_cache`, `TransformerConfig.init_cache`). The
+mode can also be set via the `GEMMA_KV_CACHE_MODE` and
+`GEMMA_KV_PREFILL_MODE` environment variables for A/B testing without
+editing call sites.
+
+`KVPrefillMode` is single-valued today; it exists as a hook for a
+future prefill optimization (direct prefill into the ring buffer)
+without changing the public sampler API.
+
+### 3.2 Per-layer cache shapes
+
+In
+[`gemma/gm/nn/gemma4/_config.py`](./gemma/gm/nn/gemma4/_config.py),
+`TransformerConfig.init_cache` selects between layer factories per
+attention type:
+
+```python
+local_window_size = (
+    min(cache_length, self.sliding_window_size)
+    if use_local_window and self.sliding_window_size is not None
+    else None
+)
 for i, attn_type in enumerate(self.attention_types):
-  if (attn_type == _modules.AttentionType.GLOBAL
-      and self.global_key_size is not None):
-    cache[f'layer_{i}'] = _modules.Attention.init_cache(
-        cache_length,                                            # uniform
-        self.num_global_kv_heads if self.num_global_kv_heads
-        else self.num_kv_heads,
-        self.global_key_size,
-        batch_size, dtype)
+  if attn_type == AttentionType.GLOBAL and self.global_key_size is not None:
+    cache[f'layer_{i}'] = Attention.init_cache(           # full L
+        cache_length, ..., self.global_key_size)
+  elif use_local_window:
+    cache[f'layer_{i}'] = Attention.init_local_window_cache(  # W
+        local_window_size, self.num_kv_heads, self.head_dim, ...)
   else:
-    cache[f'layer_{i}'] = _modules.Attention.init_cache(
-        cache_length,                                            # uniform
-        self.num_kv_heads,
-        self.head_dim,
-        batch_size, dtype)
+    cache[f'layer_{i}'] = Attention.init_cache(           # legacy: full L
+        cache_length, self.num_kv_heads, self.head_dim, ...)
 ```
 
-The two branches differ in `num_kv_heads` and `head_dim` only. The
-`cache_length` argument is identical for global and local-sliding
-layers. The mask in
-[`gemma4/_modules.py:338-349`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/nn/gemma4/_modules.py#L338-L349)
-already discards everything outside the window — no slot beyond
-`sliding_window_size` is ever attended to in a local-sliding layer.
+`Attention.init_local_window_cache`
+([`gemma4/_modules.py`](./gemma/gm/nn/gemma4/_modules.py)) allocates a
+`[B, W, H, D]` k/v pair plus two metadata arrays that legacy caches do
+not have:
 
-The same pattern exists in
-[`gemma3n/_config.py:178-194`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/nn/gemma3n/_config.py#L178-L194).
-The original Gemma 1-3 path
-([`gemma/gm/nn/_config.py:120-142`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/nn/_config.py#L120-L142))
-is uniform but Gemma 1-3 don't have hybrid attention, so it's not a
-loss there.
+- `logical_index: [B, W] int32` — the logical token position stored at
+  each physical slot. Initialized to `-1`.
+- `valid: [B, W] bool` — whether the slot currently holds a real K/V.
+  Initialized to `False`.
 
-### 2.4. Decode-step writes
+A simple duck-typed predicate
+(`is_local_window_layer(layer_data)` returns `'logical_index' in
+layer_data`) lets the rest of the code distinguish the two layouts
+without a separate enum threaded through the cache pytree.
 
-Each decode step writes one slot via `dynamic_update_slice` /
-`array.at[...].set(...)` into the pre-allocated buffer; there is no
-physical growth. The write index uses modular wrap (`end_index %
-cache_size` at
-[`gemma4/_modules.py:304`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/nn/gemma4/_modules.py#L304))
-but the loop halts before the wrap matters — `cond_fn` checks
-`is_full = end_index >= total_cache_length - 1`
-([`_cache_helper.py:86-89`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/utils/_cache_helper.py#L86-L89),
-[`_sampler_loop.py:160-171`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/text/_sampler_loop.py#L160-L171)).
-The mod-wrap is defensive, not load-bearing.
+### 3.3 Decode-step write
 
-### 2.5. The "is_full" first-layer assumption
+The decode loop's per-step write
+([`Attention.__call__` in `gemma4/_modules.py`](./gemma/gm/nn/gemma4/_modules.py))
+becomes one branch when the layer carries `logical_index`/`valid`:
 
-`Cache.total_cache_length` reads `next(iter(self.cache.values()))['k'].shape[1]`
-([`_cache_helper.py:43-47`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/utils/_cache_helper.py#L43-L47)).
-It assumes every layer has the same cache length. **Any change that
-introduces per-layer cache sizes must update this method** to either
-(a) return the max across layers, or (b) be replaced with per-layer
-queries.
+- The physical slot is `segment_pos % W` (ring write).
+- `k`, `v`, and `positions` are updated by
+  `dynamic_update_slice`-style scatter at the physical slot.
+- `logical_index` at the physical slot is set to the absolute logical
+  token position; `valid` is set to `True`.
+- The post-write cache leaves are re-constrained against the incoming
+  cache leaf sharding so the functional update doesn't fall back to
+  replicated.
 
----
-
-## 3. Proposed Changes
-
-This proposal includes **two independent but composable changes**,
-ranked by HBM impact at long context. Either can be merged
-independently.
-
-### 3.1. Change A: right-size LOCAL_SLIDING cache to the window
-
-**Summary.** Cap each local-sliding layer's cache size at
-`min(cache_length, sliding_window_size)`. Global layers retain the
-full `cache_length`.
-
-The implementation should be toggled with `KVCacheMode`, defaulting to
-`LEGACY`, and prefill should expose `KVPrefillMode.LEGACY_SCRATCH`
-through `GEMMA_KV_PREFILL_MODE=legacy_scratch` so benchmarks can record
-the active prefill strategy explicitly.
-
-**Why not "+1".** The window mask at
-[`gemma4/_modules.py:50-51`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/nn/gemma4/_modules.py#L50-L51)
-uses strict bounds: `cache_position > position - sliding_window_size`
-and `cache_position < position + sliding_window_size`. With the normal
-causal mask during decode, that admits the current token plus the
-previous `sliding_window_size - 1` tokens. The persistent causal local
-cache therefore needs exactly `sliding_window_size` slots, not
-`sliding_window_size + 1`.
-
-**HBM saved (E4B, batch=1, bf16, per chip if currently replicated):**
-
-| `cache_length` | Current local cache | After change | Savings per chip |
-|---:|---:|---:|---:|
-|   4 096 | 280 MiB |  35 MiB | **245 MiB** |
-|  16 384 | 1.10 GiB |  35 MiB | **1.07 GiB** |
-|  32 768 | 2.19 GiB |  35 MiB | **2.16 GiB** |
-| 131 072 | 8.75 GiB |  35 MiB | **8.72 GiB** |
-
-(Local-cache size becomes constant once `cache_length >= window`. The
-~35 MiB figure for E4B is `35 layers x 1 x 512 x 2 x 256 x 2(k+v) x 2 B`.)
-
-For 31B (50 local + 10 global, sliding_window=1024, num_kv_heads=16
-local / 4 global): savings scale by ~ `50/35 × 16/2 ≈ 11×` versus E4B
-in absolute terms.
-
-**Implementation.**
-
-Patch [`gemma/gm/nn/gemma4/_config.py:157-193`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/nn/gemma4/_config.py#L157-L193):
+The attention computation gathers the sampler's full logical mask
+through `logical_index` before applying the sliding-window mask:
 
 ```python
-def init_cache(self, batch_size, dtype=jnp.bfloat16, *, cache_length):
-  if cache_length is None:
-    raise ValueError('Missing `cache_length=` kwarg when calling `init_cache()`.')
-
-  # NEW: Local-sliding layers only ever read sliding_window_size slots.
-  # Cap their cache to that to avoid allocating bytes that are guaranteed
-  # to be masked out at attention time.
-  local_cache_length = (
-      min(cache_length, self.sliding_window_size)
-      if self.sliding_window_size is not None
-      else cache_length
-  )
-
-  cache: Cache = {}
-  for i, attn_type in enumerate(self.attention_types):
-    if (attn_type == _modules.AttentionType.GLOBAL
-        and self.global_key_size is not None):
-      cache[f'layer_{i}'] = _modules.Attention.init_cache(
-          cache_length,                                  # full
-          self.num_global_kv_heads or self.num_kv_heads,
-          self.global_key_size,
-          batch_size, dtype)
-    else:
-      cache[f'layer_{i}'] = _modules.Attention.init_cache(
-          local_cache_length,                            # NEW: window-capped
-          self.num_kv_heads,
-          self.head_dim,
-          batch_size, dtype)
-  return cache
+# Cache stores W physical slots; mask is sized to the logical cache
+# length. Map each physical slot to its logical position and gather:
+safe_index = jnp.clip(cache_logical_index, 0, logical_len - 1)
+gathered_mask = jnp.take_along_axis(full_mask, safe_index, axis=-1)
+gathered_mask = gathered_mask & cache_valid[..., None, :]  # invalidate empties
 ```
 
-Do Gemma 4 first. Mirror into Gemma 3n only after the Gemma 4 path has
-passed equivalence tests, because Gemma 4 is the critical long-context
-path and already exercises heterogeneous local/global head dimensions.
+This means the sliding mask's `cache_position` comparison continues to
+use the stored absolute `positions` (not physical slot index), so
+ring-buffer wraparound and per-row independence work without any
+special casing in the math.
 
-**Required collateral changes.** Per-layer cache sizes now vary, so
-several pieces of code that assume a uniform layer cache need to be
-fixed:
+### 3.4 Prefill: scratch then compact
 
-1. **`Cache.total_cache_length`**
-   ([`_cache_helper.py:43-47`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/utils/_cache_helper.py#L43-L47)).
-   Currently reads layer 0's `k.shape[1]`. Must return either the max
-   across layers or be replaced with a per-layer query. Recommendation:
-   `return max(d['k'].shape[1] for d in self.cache.values())`. The
-   `is_full` semantic at line 86-89 should then use the max — i.e.,
-   "stop sampling when the *largest* (typically global) cache is full",
-   not when the local cache fills up at the sliding-window boundary.
+Prefill remains correct-by-construction by routing local layers through
+a full-size scratch cache that has no `logical_index`/`valid` metadata,
+running `model.apply` against the scratch, and compacting each row's
+last $W$ valid logical slots into the persistent ring at end of
+prefill.
 
-2. **Full logical masks plus physical local-slot mapping.**
-   `SamplingState.attention_mask_for_step` should continue to build a
-   mask at the full logical cache length. Local attention cannot rely
-   on implicit einsum truncation once the local cache is ring-buffered:
-   physical slot `s` no longer means logical token `s`. Local cache
-   entries need `logical_index` and `valid` metadata, and
-   `Attention.__call__` must gather the logical mask onto physical
-   slots before applying the sliding mask.
+In [`gemma/gm/text/_prefill.py`](./gemma/gm/text/_prefill.py):
 
-3. **Prefill prompt longer than `sliding_window_size`.** Do not simply
-   pass a window-sized local cache into prefill. The attention module
-   writes K/V into the supplied cache before computing attention; a
-   window-sized prefill cache would overwrite early prompt K/V before
-   later prompt tokens and later global layers can use them. The safe
-   first implementation is:
-   - Allocate the persistent decode cache with local layers sized to
-     `sliding_window_size`.
-   - Build a full-size prefill scratch cache for local layers, with no
-     local-window metadata, so prefill attention has legacy semantics.
-   - Run `model.apply` against the scratch.
-   - Compact the returned local layers back into the persistent ring
-     cache.
-   - Copy returned global layers into the persistent global cache.
+- `_make_prefill_input_local_window` builds the scratch cache. Each
+  local layer gets a `[B, prefill_cache_length, H, D]` k/v buffer
+  matching the prompt bucket length. If the persistent ring already
+  holds valid logical slots (multi-turn case), those slots are
+  scattered into the scratch at their `logical_index` so prefill
+  attention sees the same history as a legacy run.
+- `_compact_local_window_layer` is the load-bearing piece. It takes a
+  full-size scratch layer plus a `logical_valid_mask` over prefill
+  positions and, per batch row independently:
+  1. Rank the valid logical positions and select the **last $W$ valid
+     positions**. (Not "the last $W$ physical positions" — that would
+     be wrong for padded batches where one row finished much earlier
+     than another.)
+  2. Place each selected entry into physical slot
+     `selected_pos % W`.
+  3. Write `(k, v, positions, logical_index)`, set `valid=True` for
+     occupied physical slots, and leave the rest invalid.
 
-4. **Compaction must be per batch row.** A naive "last W logical slots"
-   compaction is wrong for padded batches: a short row can have live
-   local-context prompt tokens near logical slots 0..N while another
-   row forced the bucket to a much larger logical length. The safe rule
-   is to keep the last W valid logical slots per batch row, place each
-   by `absolute_position % W`, and store the original logical slot in
-   `logical_index` for future mask gathers.
+The implementation is in
+[`_prefill.py:589-668`](./gemma/gm/text/_prefill.py#L589-L668). The
+unit test that exercises the compaction across the three regimes
+(`prompt_len < W`, `== W`, `> W`) plus a padded-batch case is at
+[`examples/cache_local_window_test.py`](./examples/cache_local_window_test.py).
 
-5. **Decode writes must evict by position, not padded logical index.**
-   Local-window decode writes should use `segment_pos % window` for the
-   physical slot and store `end_index + arange(seq_len)` only as
-   `logical_index` metadata. This preserves the local sliding window
-   for padded rows while keeping the sampler's full logical mask
-   intact.
+Global layers do not go through compaction — they use the existing
+prefill path unchanged.
 
-**Risks.**
+### 3.5 Per-layer shapes and `is_full`
 
-- **Correctness of scratch compaction.** Need to verify that ROPE
-  positions, `cache_positions`, `logical_index`, and `valid` are
-  correct after the prefill+merge dance. The sliding mask at
-  [`gemma4/_modules.py:343-349`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/nn/gemma4/_modules.py#L343-L349)
-  uses `cache_positions` (the actual position stored at each slot), so
-  as long as we write the correct `positions` alongside the K/V values
-  and gather the logical mask through `logical_index`, the ring-buffer
-  math handles wraparound. Add regression tests for prompt lengths
-  `< window`, `== window`, and `> window`, plus padded batches where
-  one row is much shorter than the bucket length.
-- **Recompilation.** Changing layer shapes triggers a JIT recompile.
-  Acceptable, one-time.
-- **`is_full` semantics.** Today the loop stops when *layer 0* fills.
-  Layer 0 is local-sliding in every Gemma 4 variant, so today the
-  loop currently stops when the local cache fills (around step 512), which
-  is *the wrong stopping condition* for global layers. Today this
-  isn't observed because users typically pick `cache_length ≥ 4096 ≫
-  sliding_window` and don't notice. After this change, with the local
-  cache *physically* sized to the window, the same `is_full` would fire
-  at step 512 always. The sampler loop must stop on the logical
-  `SamplerLoop.cache_length` or `state.full_attention_mask.shape[-1]`,
-  not on any local layer's physical shape.
+With local layers physically sized to $W$ and global layers sized to
+$L$, the assumption that every layer has the same cache length no
+longer holds. Two places that read it are fixed:
 
-**Test plan.**
+- **`Cache.total_cache_length`** in
+  [`_cache_helper.py`](./gemma/gm/utils/_cache_helper.py) now returns
+  `max(d['k'].shape[1] for d in self.cache.values())`. For legacy
+  caches this is unchanged; for local-window caches this returns the
+  global (logical) cache length, which is what callers want for mask
+  sizing and stop-condition checks.
+- **The sampler-loop stop condition** in
+  [`_sampler_loop.py`](./gemma/gm/text/_sampler_loop.py) compares
+  `used_cache_length >= self.cache_length - 1` against the static
+  logical `cache_length`, not any layer's physical shape. (Under the
+  old code, with `LOCAL_WINDOW` enabled, the loop would have halted
+  at step $W{-}1$ because layer 0 is local-sliding in every Gemma 4
+  variant.)
 
-1. **Unit test:** for every Gemma 4 variant, verify
-   `model.init_cache(cache_length=4096)` produces local-layer cache
-   shapes of `[1, sliding_window_size, num_kv_heads, head_dim]` and
-   global-layer caches of `[1, 4096, num_global_kv_heads or
-   num_kv_heads, global_key_size or head_dim]`.
-2. **Numerical equivalence:** run a fixed prompt with a fixed RNG seed
-   through `ChatSampler.chat()` before and after the change. Output
-   tokens should match for greedy sampling. Logits only need BF16
-   tolerance because compacting/gathering can change reduction order.
-3. **HBM regression:** run [`examples/cache_probe.py`](./examples/cache_probe.py)
-   at L=4096 and L=16384 and verify the per-chip steady-state delta
-   drops as predicted in §3.1's table.
+There is also a small latent bug in the legacy path: `is_full` was
+defined against layer 0's physical shape, which is always a
+local-sliding layer in Gemma 4. With `cache_length \gg W`, layer 0 was
+never sized below `cache_length` so the bug was not user-visible. The
+fix to read the max keeps legacy semantics intact while fixing the
+latent issue.
 
-### 3.2. Change B: cache sharding contract
+---
 
-**Summary.** Add a model-level contract that exposes a
-`PartitionSpec` pytree for the cache, computed from the model config
-and the active mesh. Apply it inside `init_cache` regardless of
-whether the user passed a `sharding=` kwarg. For batch=1 decode, shard
-along `num_kv_heads` when the head count is divisible by the mesh's TP
-axis size; replicate otherwise.
+## 4. Measured behavior on TPU v5e
 
-**Why this and not "expose more knobs to the user".** Today's
-`sharding=` kwarg is a generic `kd.sharding.ShardingTree`. The user has
-no documented way to construct one for the cache (no example exists in
-the repo, and `kd.sharding.FSDPSharding()` — the only documented
-sharding helper — shards axis 0, which is `batch` in the cache, which
-is 1 at decode time). The cache *is* a model-internal data structure
-with a model-internal layout; the model is the right place to know how
-it should partition.
+The numbers below come from runs against this branch using the
+benchmark suite under
+[`cloud-deploy-agent`](https://gitlab.cs.washington.edu/kburtram/cloud-deploy-agent),
+on TPU v5e-4, v5e-8, and v5e-16. The application workload is a
+deterministic 21-case agent benchmark; cases are short, single-turn
+chat completions against a strict-validation final-report gate. Stock
+versus fork are differentiated only by `GEMMA_KV_CACHE_MODE`.
 
-**HBM saved (E4B at L=4096, currently 392 MiB replicated on every chip
-of a 4-chip slice = 1.57 GiB total slice HBM):**
+### 4.1 Cross-slice scaling
 
-- E4B (`num_kv_heads=2`, 4 chips → TP=2 + replicate=2): each chip
-  holds 1/2 of the cache → 196 MiB / chip → **196 MiB saved per chip**
-  (vs. 392 MiB replicated). Total slice HBM drops from 1.57 GiB → 784
-  MiB.
-- 31B (`num_kv_heads=16` local, 4 global, 4 chips → TP=4): each chip
-  holds 1/4 → **3/4 saved per chip** for local layers; global layers
-  shard exactly 4-ways. Roughly 4× per-chip cache reduction.
-- 26B-A4B (`num_kv_heads=8` local, 2 global, 4 chips → TP=4 for local,
-  TP=2+rep for global): roughly 4× for local, 2× for global.
-- E2B (`num_kv_heads=1`, can't shard heads): no win — falls back to
-  replication (current behavior). Acceptable.
+![Cross-slice scaling for Gemma 4 E4B at B=1. Left: peak per-chip HBM
+versus cache length. Stock sampler (dashed) hits the chip cap as L
+grows on each slice; local-window (solid) stays below the cap because
+only the 7 global layers retain full-history KV state. Right: largest
+reliable application context per slice and cache mode, measured as the
+largest cache_length with ok_rate >= 0.95.](docs/figures/cross_slice_scaling.png)
 
-Composes multiplicatively with Change A. Combined for 31B at
-`cache_length=32768`:
+Largest reliable cache length, $\texttt{ok\_rate} \ge 0.95$ on the
+21-case benchmark:
 
-- Today: ~30 GiB replicated, OOMs immediately.
-- Change A only: ~4 GiB replicated.
-- Change B only: ~7-8 GiB per chip.
-- Change A + B: ~1 GiB per chip — fits with room for activations.
+| Slice  | Stock | Local-window | Within-slice gap |
+|--------|------:|-------------:|-----------------:|
+| v5e-4  |   8k  |   8k         | parity           |
+| v5e-8  |  16k  |  32k         | 2×               |
+| v5e-16 |  16k  |  64k         | 4×               |
 
-**Implementation.**
+On v5e-4 the fork is at parity in this metric — it does not raise the
+largest serviceable context on a 4-chip slice, because the workload's
+prompt and chat lengths fit within 8k regardless. The slice-scaling
+story starts at v5e-8 and is clearest on v5e-16, where stock fails to
+use a 4× larger HBM pool for cache headroom.
 
-Add a method to `TransformerConfig` (Gemma 4) — and analogous changes
-to Gemma 1-3 and Gemma 3n configs — that returns a cache partition
-spec given the active mesh:
+Peak per-chip HBM at $L{=}65{,}536$ on v5e-16 under the fork remains
+in the $10$–$11$ GiB range for E4B, with $\sim 5$ GiB of headroom below
+the v5e chip cap ($\approx 15.75$ GiB). Stock fails to load this cell.
+
+### 4.2 v5e-4 clean serving cell
+
+The cleanest comparison is on v5e-4 at $L{=}8192,\, B{=}1$, where both
+modes serve every case. This isolates the prefill cost from the
+correctness behavior at the cache-cap regime.
+
+| Metric                          | Stock  | Local-window | Δ                 |
+|---------------------------------|-------:|-------------:|-------------------|
+| peak per-chip HBM (GiB)         |  12.80 |        11.58 | −1.22 GiB (−9.5%) |
+| prefill $p_{50}$ (ms)           |  1,410 |        1,686 | +275 ms (+19%)    |
+| decode per-token $p_{50}$ (ms)  |  0.114 |        0.100 | −0.014 ms (−12%)  |
+| service $p_{50}$ (ms)           |  1,452 |        1,732 | +280 ms (+19%)    |
+| `ok_rate`                       |  1.000 |        1.000 | +0.000            |
+| `expected_ok_rate`              |  0.714 |        0.762 | +0.048            |
+| elapsed $p_{95}$ (s)            |   83.0 |         92.7 | +9.7 s (+12%)     |
+
+This is a regime where stock has not run out of room — the cost
+appears as a real `service_p50` increase, not as an availability gain.
+The trade is visible: roughly $1.2$ GiB of per-chip headroom for
+roughly $19\%$ added prefill latency. Per-token decode is faster
+because the gather attends $W{=}512$ physical slots rather than $L$,
+which dominates at the per-step level. The `expected_ok_rate` gap from
+$1.0$ is agent-quality, not serving-quality: four mixed-remediation
+cases leave SQL merge conflicts open. Both modes show the same gap.
+
+### 4.3 v5e-4 long-context grid
+
+At $L \ge 16{,}384$ on v5e-4, the picture flips: stock saturates the
+$\approx 15.73$ GiB per-chip cap and either fails to serve or runs
+with no margin for activations; the fork keeps measurable headroom.
+
+![Peak per-chip HBM versus cache length on v5e-4 (B=1). The stock
+sampler (dashed) saturates the ~15.73 GiB chip cap by L=16384 and
+loses headroom; the local-window fork (solid) keeps 1.5–3.7 GiB
+headroom across the same
+grid.](docs/figures/v5e4_hbm_vs_cache.png)
+
+![Service-latency p50 versus cache length on v5e-4 (B=1). The fork's
+prefill cost shows up as 19–32% on service_p50 across the long-context
+grid, with the gap closing slightly at the longest L because the
+per-token decode advantage starts to compensate.](docs/figures/v5e4_service_latency.png)
+
+Across the grid the fork's wall-clock cost is $19$–$32\%$ on
+`service_p50`. This is essentially all in the prefill compaction; the
+per-token decode component is $\le 12\%$ faster under the fork at
+every cell tested.
+
+### 4.4 v5e-16 frontier behavior
+
+At long context on v5e-16, the local-window cache is necessary but not
+sufficient for the larger Gemma 4 variants — 26B MoE and 31B dense
+also need parameter sharding to fit, which is handled by mesh-level
+configuration in the agent CLI, not by this Gemma branch. For E4B the
+fork alone is sufficient: at $L{=}65{,}536, B{=}1$, the v5e-16 chips
+peak at $\sim 4.9$ GiB load + cache for parameters and KV combined,
+versus $\sim 15.73$ GiB cap, with the 21-case benchmark passing every
+case.
+
+---
+
+## 5. Cost characterization
+
+The local-window mode is a tradeoff, not a free win. The honest
+breakdown:
+
+- **Prefill compaction cost.** At the v5e-4 clean cell, $+275$ ms on
+  `prefill_p50` ($+19\%$). Across the v5e-4 long-context grid this
+  scales to $19$–$32\%$ on `service_p50`. The dominant work is the
+  per-row rank-and-place compaction in `_compact_local_window_layer`,
+  which is $O(B \cdot P \cdot W)$ where $P$ is the prompt-bucket
+  length. This cost is paid once per prefill (not per turn in
+  multi-turn mode after the first turn — subsequent turns add only
+  one local-window write per generated token).
+
+- **Decode per-token cost.** $-12\%$ at the v5e-4 clean cell
+  ($0.100$ vs $0.114$ ms). The win is structural: the local-attention
+  gather reads $W$ physical slots rather than $L$, and the logical-mask
+  gather is also $W$-bounded.
+
+- **HBM trade.** At the clean cell, the fork frees $1.22$ GiB per
+  chip. At the long-context grid the freed headroom is what makes the
+  fork serviceable where stock is not.
+
+- **Net.** At $L \le 8$k the fork costs `service_p50` without
+  buying availability. Past $8$k the fork is what makes the request
+  serve at all. The opt-in default reflects this: users who do not
+  need long context should keep the default; users who do need long
+  context can opt in.
+
+- **What the fork does not change.** Numerics on the global layers
+  are bit-identical. Numerics on the local layers are within bf16
+  tolerance of legacy on the test set; the gather-then-mask order is
+  algebraically equivalent to mask-then-implicit-truncate but
+  reduction order can change. Greedy sampling tokens match legacy
+  greedy for the test prompts in
+  [`examples/cache_local_window_test.py`](./examples/cache_local_window_test.py).
+
+---
+
+## 6. API surface
+
+The cache mode is plumbed through the samplers as a constructor kwarg.
+The default is `KVCacheMode.LEGACY` everywhere, so an existing call
+site that does not pass `kv_cache_mode=` sees stock behavior.
 
 ```python
-def cache_partition_spec(self, mesh, *, tp_axis: str = 'tensor'):
-  """Return a PartitionSpec pytree for the cache.
+from gemma import gm
 
-  Shards k/v along num_kv_heads when the head count is divisible by the
-  TP axis size; otherwise leaves replicated. Other cache fields
-  (positions, end_index) are always replicated.
-  """
-  from jax.sharding import PartitionSpec as P, NamedSharding
-  if tp_axis not in mesh.axis_names:
-    # No TP axis — replicate everything.
-    pspec_kv = P()
-    pspec_pos = P()
-    pspec_end = P()
-  else:
-    tp_size = mesh.shape[tp_axis]
-    # Replicate fallback if any layer's heads don't divide evenly.
-    def kv_spec(num_heads):
-      return P(None, None, tp_axis, None) if num_heads % tp_size == 0 else P()
-    # We build a per-layer spec because num_kv_heads can vary.
-    ...
+# Default: legacy behavior, unchanged.
+sampler = gm.text.ChatSampler(model=model, params=params, cache_length=8192)
 
-  spec_tree = {}
-  for i, attn_type in enumerate(self.attention_types):
-    if attn_type == _modules.AttentionType.GLOBAL and self.global_key_size:
-      heads = self.num_global_kv_heads or self.num_kv_heads
-    else:
-      heads = self.num_kv_heads
-    spec_tree[f'layer_{i}'] = {
-        'k': NamedSharding(mesh, kv_spec(heads)),
-        'v': NamedSharding(mesh, kv_spec(heads)),
-        'positions': NamedSharding(mesh, P()),
-        'end_index': NamedSharding(mesh, P()),
-    }
-  return spec_tree
+# Opt-in to local-window for long context.
+sampler = gm.text.ChatSampler(
+    model=model, params=params, cache_length=65536,
+    kv_cache_mode=gm.utils.KVCacheMode.LOCAL_WINDOW,
+)
 ```
 
-Then in
-[`gemma/gm/nn/gemma4/_transformer.py:399-412`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/nn/gemma4/_transformer.py#L399-L412):
+The mode also reads from `GEMMA_KV_CACHE_MODE` when no kwarg is
+passed, which is the path the benchmark suite uses to A/B test without
+editing call sites.
 
-```python
-def init_cache(self, *, batch_size, dtype, cache_length, sharding=None):
-  cache = self.config.init_cache(
-      batch_size=batch_size, dtype=dtype, cache_length=cache_length)
+Three considerations a maintainer might prefer to handle differently,
+all of which I would be happy to iterate on:
 
-  # NEW: derive a model-aware default sharding from the active mesh,
-  # use it unless the user passed an explicit sharding.
-  if sharding is None:
-    mesh = _get_active_mesh()  # via jax.sharding.get_abstract_mesh() or similar
-    if mesh is not None:
-      sharding = self.config.cache_partition_spec(mesh)
+1. **Naming.** `LOCAL_WINDOW` is descriptive but not necessarily the
+   right slot in the public taxonomy. `RingBufferLocal` or
+   `WindowSizedLocalKV` are alternatives. The current naming was
+   chosen to leave room for additional modes (e.g., a future
+   direct-prefill variant) without renaming the enum.
 
-  return kd.sharding.with_sharding_constraint(cache, sharding)
-```
+2. **Placement of the enum.** `KVCacheMode` currently lives in
+   `gemma/gm/utils/_cache_helper.py`. If the convention is for public
+   enums to live in a different module (e.g., `gemma/gm/text/`), I can
+   move it.
 
-Also: add `with_sharding_constraint` after every per-step cache write
-in `Attention.__call__` so the per-step `dynamic_update_slice` /
-`array.at[...].set(...)` doesn't all-gather the result back to a
-replicated layout. Locations:
-- Gemma 4: [`gemma4/_modules.py:307-316`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/nn/gemma4/_modules.py#L307-L316).
-- Gemma 1-3: [`_modules.py:213-238`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/nn/_modules.py#L213-L238).
-- Gemma 3n: corresponding section in `gemma3n/_modules.py`.
+3. **Default.** The current default is `LEGACY`. If a maintainer
+   prefers `LOCAL_WINDOW` to become the default for Gemma 4 — the data
+   suggests it should be at $L \ge 16$k — that is a one-line change
+   per call site, but it is a behavior change for existing users and
+   I left it out of this PR to keep the diff strictly additive.
 
-**Risks.**
-
-- **Mesh discovery.** Inside `nn.jit init_cache`, getting hold of "the
-  active mesh" requires either (a) requiring the user to pass it
-  explicitly, (b) using `jax.sharding.get_abstract_mesh()` (modern JAX),
-  or (c) inferring it from the params via `jax.tree.leaves(params)[0].sharding.mesh`.
-  Recommendation: (c), because it ensures the cache mesh matches the
-  param mesh — same TP axis, same chip ordering — and (c) doesn't
-  require any change to the public sampler API.
-- **Per-step all-reduce.** With cache sharded by heads and queries
-  replicated, the per-step attention op is `jnp.einsum('BTNH,BSNH->BTNS', q, k_sharded)`
-  which produces a `BTNS` result with `N` sharded — fine, no reduce
-  needed yet — and then `'BTNS,BSNH->BTNH'` produces a `BTNH` with `N`
-  sharded. The output projection `'BTNH,NHD->BTD'` reduces over `N`,
-  triggering an all-reduce. On v5e this is bandwidth-bound by ICI;
-  empirical cost should be small (≪ 1 ms / step) but must be measured.
-- **Non-divisible head counts.** E4B's `num_kv_heads=2` on a 4-chip
-  slice → TP=2, replicate=2 (the audit script confirms this works).
-  E2B's `num_kv_heads=1` → fall back to replication. The proposed
-  helper handles both via the `kv_spec(heads)` divisibility check.
-- **Backward compatibility.** Today the user can pass a
-  `sharding=`. We should preserve that as an override: if the user
-  passed an explicit non-`None` sharding, do not auto-derive. This
-  keeps the existing API contract and lets advanced users override.
-
-**Test plan.**
-
-1. **Audit:** [`examples/cache_audit.py --variant {e4b,31b,26b_a4b}
-   --shard heads`](./examples/cache_audit.py) already exists; verify
-   the auto-shard logic in `init_cache` produces the same
-   `NamedSharding(..., P(None, None, 'tensor', None))` on k/v that the
-   audit script's `--shard heads` mode produces.
-2. **HBM regression:** [`examples/cache_probe.py`](./examples/cache_probe.py)
-   should show **per-chip peak deltas drop by ~TP×** for E4B/31B.
-   E4B at L=4096 should drop from 1.6 GiB peak / chip to ~800 MiB
-   peak / chip. 31B at L=4096 should drop from ~3.7 GiB peak (today)
-   to ~900 MiB peak.
-3. **Numerical equivalence:** logit-level comparison before/after the
-   change for a fixed prompt and seed. Sharding does not change math.
-4. **Compile-time / step-time microbenchmark:** measure decode steps/sec
-   before and after on E4B at L=4096. Acceptance: ≤ 5% slowdown from
-   the per-step all-reduce on a 4-chip v5e slice.
-
-### 3.3. Out of scope but worth noting: the transient 2× cache copy
-
-The runtime probe shows a steady-state delta of ~800 MiB at L=4096 —
-about 2× the logical 392 MiB cache. The extra copy is created in
-`_merge_cache` at
-[`_prefill.py:357-366`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/text/_prefill.py#L357-L366):
-
-```python
-return full_cache.at[:, : prefill_cache.total_cache_length].set_kv(prefill_cache)
-```
-
-`Cache.at[].set_kv()` uses `jnp.ndarray.at[...].set(...)` semantics
-([`_cache_helper.py:113-119`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/utils/_cache_helper.py#L113-L119),
-[`_cache_helper.py:149-155`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/utils/_cache_helper.py#L149-L155)),
-which is functional. Without `donate_argnums` on the surrounding jit,
-JAX may keep both the old and new buffers alive briefly, causing a
-~2× transient. After the merge, `last_state.cache` retains the
-*new* buffer; the old `full_cache` should be garbage-collected. The
-fact that the steady-state delta is 2× suggests the old buffer is
-still being held — likely because it's the input to `_merge_cache`
-inside the JITted prefill, and JAX keeps it alive until the prefill
-function returns.
-
-This isn't part of this proposal, but a follow-up could:
-- Donate the input cache buffer in the prefill jit
-  (`jax.jit(prefill_fn, donate_argnums=...)`).
-- Or restructure prefill to write directly into `full_cache` without
-  the intermediate small-cache prefill + merge.
-
-Estimated savings: an additional ~1× cache (cuts the per-chip
-steady-state delta from 2×cache to 1×cache).
-
-### 3.4. Stack rank
-
-If only one change can be merged: **Change A**. It's smaller, safer,
-benefits every Gemma 4 variant including E2B, and saves the most
-absolute bytes at long contexts. Change B has a hard ceiling on E2B
-(`num_kv_heads=1` is not shardable) and is most valuable on the bigger
-models that already need the 8x slice.
-
-If both can be merged: ship them together. They compose
-multiplicatively for HBM and touch nearby code. The combined
-expected reduction in per-chip cache HBM:
-
-| Model | L | Today (replicated) | A only | B only | A + B |
-|---|---:|---:|---:|---:|---:|
-| E4B  |  4 096 | 392 MiB | 147 MiB | 196 MiB | 74 MiB |
-| E4B  | 16 384 | 1.51 GiB | 483 MiB | 753 MiB | 241 MiB |
-| 31B  |  4 096 | 3.69 GiB | 1.17 GiB | 920 MiB | 290 MiB |
-| 31B  | 32 768 | 29.5 GiB | 3.52 GiB | 7.4 GiB | 880 MiB |
-
-(Absolute numbers per chip, batch=1, bf16, 4-chip slice for E4B and
-31B. 31B at L=32K with current code does not fit; with both changes,
-fits with substantial headroom.)
+4. **`KVPrefillMode` exposure.** `LEGACY_SCRATCH` is the only mode,
+   and the enum exists as a hook for a future direct-prefill
+   optimization. If a maintainer would prefer not to expose a
+   single-valued enum, the prefill branch can be selected internally
+   from `KVCacheMode` and `KVPrefillMode` can be deleted.
 
 ---
 
-## 4. Risks & Open Questions
+## 7. Scope and limitations
 
-1. **`is_full` semantics.** Currently a soft bug today (loop stops
-   when layer-0 fills, which today is local-sliding). Change A makes
-   this strictly observable. Fix in scope of Change A, but worth
-   reviewer eyes.
-2. **Mesh discovery for Change B.** Recommend inferring from
-   `params` to avoid public-API churn; reviewer may prefer an explicit
-   API.
-3. **Per-step all-reduce cost on Change B.** Need empirical
-   measurement before claiming step-time parity. If the all-reduce
-   exceeds ~5% of step time, consider replicating queries after the
-   sharded attention output (or using `jax.lax.psum_scatter` /
-   `with_sharding_constraint` to keep the reduce out of the critical
-   path).
-4. **Multi-turn correctness.** Multi-turn reuses
-   `prev_turns.cache`. After Change A, the cache shape is
-   `{layer_i: [B, layer_cache_size, ...]}` per layer. Code paths that
-   inspect cache shape (e.g.
-   [`_chat_sampler._remove_eos_token`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/text/_chat_sampler.py#L445)
-   touches `cache_info` but only `end_index`) should be audited.
-5. **Compatibility with `KVCacheSharingConfig`** for the
-   shared-layer path
-   ([`gemma4/_config.py:32-84`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/nn/gemma4/_config.py#L32-L84),
-   used by E2B and E4B with `frac_shared_layers > 0`). The sharing
-   pattern shares cache between layers — Change A's per-layer sizes
-   must be consistent across shared layer pairs (which they are, since
-   sharing groups layers of the same attention type).
-6. **Quantization / LoRA.** Out of scope, but worth noting that the
-   cache lives at sampling time (no params-quantization interaction)
-   and isn't itself quantized.
+What this branch has been tested against:
 
----
+- **Models:** Gemma 4 E4B (primary), 26B MoE, 31B dense.
+- **Hardware:** TPU v5e-4, v5e-8, v5e-16.
+- **Decode:** batch=1 single-turn and multi-turn.
+- **Prefill bucket lengths:** $\le W$, $= W$, $> W$, and padded
+  batches where rows differ in prompt length, all in
+  [`examples/cache_local_window_test.py`](./examples/cache_local_window_test.py).
 
-## 5. Plan of Work
+What this branch has not been tested against:
 
-Phased so each phase is independently revertible:
-
-**Phase 0 (this proposal).** Land
-[`examples/cache_audit.py`](./examples/cache_audit.py) and
-[`examples/cache_probe.py`](./examples/cache_probe.py). They are
-read-only diagnostic tools, useful regardless of which fix lands.
-
-**Phase 1 (Change A).** Right-size local-sliding cache.
-
-1. Add per-layer cache sizing in
-   [`gemma/gm/nn/gemma4/_config.py`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/nn/gemma4/_config.py)
-   and [`gemma/gm/nn/gemma3n/_config.py`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/nn/gemma3n/_config.py).
-2. Fix `Cache.total_cache_length` and `is_full` in
-   [`gemma/gm/utils/_cache_helper.py`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/utils/_cache_helper.py).
-3. Fix prefill cache slice / merge in
-   [`gemma/gm/text/_prefill.py`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/text/_prefill.py)
-   to handle per-layer sizes.
-4. Add unit tests + numerical-equivalence test.
-5. Verify HBM reduction with `examples/cache_probe.py` on E4B at
-   L=4096 and L=16384.
-
-Estimated diff: ~80 LOC of source + ~150 LOC of tests.
-
-**Phase 2 (Change B).** Cache sharding contract.
-
-1. Add `cache_partition_spec(mesh)` to `TransformerConfig` (Gemma 4,
-   Gemma 1-3, Gemma 3n).
-2. Wire mesh inference in `Transformer.init_cache` via the params'
-   sharding.
-3. Add per-step `with_sharding_constraint` after cache writes in
-   each `Attention.__call__`.
-4. Add per-step / per-prefill numerical-equivalence + HBM tests.
-
-Estimated diff: ~120 LOC of source + ~200 LOC of tests.
-
-**Phase 3 (optional follow-up).** Address the 2× transient via
-prefill donation (§3.3).
+- **GPU backends.** The implementation is JAX-pure (no Pallas
+  kernels), so it should run on GPU, but it has not been measured
+  there.
+- **Other Gemma sizes.** Gemma 3, Gemma 3n, and other Gemma 4
+  variants beyond the three above. The `gemma3n` path uses a similar
+  hybrid attention pattern in
+  [`gemma3n/_config.py`](https://github.com/google-deepmind/gemma/blob/main/gemma/gm/nn/gemma3n/_config.py),
+  so a mirror change would be straightforward, but this branch leaves
+  that for a follow-up rather than scope-creep this PR.
+- **Other sliding-window architectures.** Longformer- and
+  Mistral-style models have the same structural opportunity, but the
+  code in this PR is specifically wired through Gemma 4's
+  `Attention.__call__` and is not framed as a general mechanism.
+- **Quantized cache.** Independent axis; can compose, has not been
+  tested.
+- **Cache sharding policies.** This branch's
+  [`_transformer.py`](./gemma/gm/nn/gemma4/_transformer.py) accepts a
+  mesh and forwards it to a per-layer partition spec for the
+  local-window cache leaves, so the metadata fields are replicated
+  while K/V can be sharded on the head axis when divisible. The
+  active mesh choice (e.g., $f16t2$ for 31B on v5e-16) is set at the
+  agent CLI layer, not inside this branch.
 
 ---
 
-## 6. Validation / Benchmark Plan
+## 8. Adjacent change in this branch: bf16 checkpoint restore
 
-The benchmarks below should be run *before* and *after* each phase to
-establish a clean attribution of savings. Use [`examples/cache_probe.py`](./examples/cache_probe.py)
-as the primary HBM measurement tool and `time` as decode-rate measurement.
+A small adjacent change in
+[`gemma/gm/ckpts/_checkpoint.py`](./gemma/gm/ckpts/_checkpoint.py)
+(+31 LOC) adds an optional `dtype=` argument to `load_params` and
+`LoadCheckpoint` that retargets only floating-point `ShapeDtypeStruct`
+leaves and leaves integer and bool metadata leaves at their checkpoint
+dtype. This is intended for inference-only runs where the on-disk
+checkpoint stores fp32 weights and the doubling of loaded parameter
+HBM is the binding factor (specifically, 31B on v5e-16 at long
+context).
 
-**Hardware:** v5e-4 (4 chips, 16 GB HBM each). v5e-8 if accessible
-for 31B confirmation.
+This change is not load-bearing for the local-window cache claim. It
+is in the branch because the two changes are used together at the
+serving level: bf16 restore makes 31B parameter footprint fit, and
+the local-window cache makes the per-layer KV footprint fit at long
+context. The bf16 restore could be split into a separate PR if
+preferred; it is included here so the branch reflects the configuration
+that produced the measured 31B/v5e-16 results in §4.4.
 
-**Models:** Gemma4_E2B (sanity, no head-sharding gain), Gemma4_E4B
-(primary), Gemma4_31B (extrapolation; v5e-8).
-
-**Workload:** single-turn `chat()` with a fixed prompt and
-`max_new_tokens=64`, `multi_turn=False`, `cache_length ∈
-{4096, 16384, 32768}`. RNG seeded.
-
-**Metrics per (model, cache_length, change):**
-
-| Metric | Source |
-|---|---|
-| Per-chip peak HBM during chat() | `device.memory_stats()['peak_bytes_in_use']` |
-| Per-chip steady-state HBM after chat() | `device.memory_stats()['bytes_in_use']` |
-| End-to-end chat() latency (warm) | `time.time()` around `sampler.chat(...)` |
-| Logit hash for first 64 sampled tokens | `hashlib.sha256(jnp.asarray(state.predicted_tokens).tobytes())` |
-
-**Acceptance criteria:**
-
-- HBM: Per-chip peak HBM drops by at least 80% of the predicted
-  savings in §3.1 / §3.2 tables. Greedy sampled tokens should match
-  before/after the change; logits should stay within BF16 tolerance.
-- Latency: ≤ 5% regression on E4B at L=4096. Long-context (L=16384+)
-  may improve due to less HBM traffic on the masked region.
-- No new compile-time blowups (compile time within 2× of baseline).
+Test coverage:
+[`gemma/gm/ckpts/_checkpoint_test.py`](./gemma/gm/ckpts/_checkpoint_test.py).
 
 ---
 
-## 7. Why this is a good idea, briefly
+## 9. Code map
 
-The Gemma-4-specific local-sliding pathology is a structural property
-of how `_config.init_cache` is written, not a feature; the masking
-code already proves the bytes are unread. The cache replication is
-similarly an artifact of "no model knows what mesh the user will run
-on" — but the model trivially knows once params have been placed. Both
-fixes are local, testable, and unlock long-context evaluation of the
-larger Gemma 4 variants on commodity TPU slices. Neither requires
-changes to the user-facing API surface.
+Files in this branch, by role:
 
----
+**Core cache layout and mode flag**
+- [`gemma/gm/utils/_cache_helper.py`](./gemma/gm/utils/_cache_helper.py)
+  — `KVCacheMode`, `KVPrefillMode`, `is_local_window_layer`,
+  `mesh_from_params`, `Cache.total_cache_length` fix.
+- [`gemma/gm/nn/gemma4/_config.py`](./gemma/gm/nn/gemma4/_config.py)
+  — per-layer cache size selection at `init_cache`.
 
-## Appendix A — Diagnostic tooling
+**Per-layer mechanism**
+- [`gemma/gm/nn/gemma4/_modules.py`](./gemma/gm/nn/gemma4/_modules.py)
+  — `Attention.init_local_window_cache`, per-step ring-buffer write,
+  logical-mask gather.
+- [`gemma/gm/nn/gemma4/_transformer.py`](./gemma/gm/nn/gemma4/_transformer.py)
+  — mode propagation and mesh inference for cache leaves.
 
-This proposal ships two read-only scripts (already in
-[`examples/`](./examples/)) used to gather the empirical numbers above.
-They are not part of the runtime path.
+**Prefill orchestration**
+- [`gemma/gm/text/_prefill.py`](./gemma/gm/text/_prefill.py)
+  — `_make_prefill_input_local_window`,
+  `_make_local_window_prefill_scratch_layer`,
+  `_merge_cache_local_window`, `_compact_local_window_layer`.
 
-- **[`examples/cache_audit.py`](./examples/cache_audit.py)** — inspects
-  the cache pytree shape/dtype/sharding per leaf without any param
-  load. `--shard heads` simulates the proposed Change B sharding so
-  reviewers can see what the post-change layout looks like.
-- **[`examples/cache_probe.py`](./examples/cache_probe.py)** — runs a
+**Sampler-loop adjustments**
+- [`gemma/gm/text/_sampler_loop.py`](./gemma/gm/text/_sampler_loop.py)
+  — stop condition reads logical `cache_length`, not layer-0
+  physical shape.
+- [`gemma/gm/text/_chat_sampler.py`](./gemma/gm/text/_chat_sampler.py)
+  and
+  [`gemma/gm/text/_gemma4_sampler.py`](./gemma/gm/text/_gemma4_sampler.py)
+  — `kv_cache_mode` constructor kwarg, defaulting to `LEGACY`.
+
+**Tests**
+- [`gemma/gm/nn/gemma4/_transformer_test.py`](./gemma/gm/nn/gemma4/_transformer_test.py)
+  — per-layer cache shape invariants under both modes.
+- [`gemma/gm/text/_prefill_test.py`](./gemma/gm/text/_prefill_test.py)
+  — prefill compaction across `prompt_len < W`, `== W`, `> W`, and
+  padded batches.
+- [`examples/cache_local_window_test.py`](./examples/cache_local_window_test.py)
+  — end-to-end local-window correctness against legacy on short
+  prompts.
+
+**Diagnostic tooling (read-only)**
+- [`examples/cache_audit.py`](./examples/cache_audit.py) — inspects
+  cache pytree shape, dtype, and sharding per leaf without loading
+  params. Useful for verifying that opt-in produces the expected
+  shapes.
+- [`examples/cache_probe.py`](./examples/cache_probe.py) — runs a
   real `ChatSampler.chat()` with FSDP-sharded params and reports
-  per-chip HBM deltas. Used to derive the runtime numbers in §1.1.
+  per-chip HBM deltas, separated by allocation phase. Used to derive
+  the v5e-4 numbers in §4.
 
-Both scripts are useful regression tools to verify Phase 1 and Phase 2
-numerically.
+**Adjacent**
+- [`gemma/gm/ckpts/_checkpoint.py`](./gemma/gm/ckpts/_checkpoint.py)
+  — optional `dtype=` for floating-leaf restore (see §8).
+
+---
+
+## 10. Reproduction
+
+The benchmark suite used for §4 lives at
+[`gitlab.cs.washington.edu/kburtram/cloud-deploy-agent`](https://gitlab.cs.washington.edu/kburtram/cloud-deploy-agent).
+The relevant entry points are:
+
+```bash
+# v5e-4 clean cell (§4.2):
+python gemma4_jax.py serve --model gemma4-e4b-it --cache-length 8192
+GEMMA_KV_CACHE_MODE=legacy        python run_benchmark.py --N 21
+GEMMA_KV_CACHE_MODE=local_window  python run_benchmark.py --N 21
+
+# v5e-4 long-context grid (§4.3):
+for L in 16384 32768; do
+  GEMMA_KV_CACHE_MODE=local_window \
+    python gemma4_jax.py serve --model gemma4-e4b-it --cache-length $L
+  python run_benchmark.py --N 21
+done
+
+# v5e-16 long-context E4B (§4.4):
+GEMMA_KV_CACHE_MODE=local_window \
+  python gemma4_jax.py serve --model gemma4-e4b-it --cache-length 65536 \
+    --mesh-2d data=8,tensor=2 --mesh-2d-param-sharding full \
+    --param-dtype bfloat16
+python run_benchmark.py --N 21
+```
+
+The Gemma-side diagnostic that doesn't require the agent harness:
+
+```bash
+GEMMA_KV_CACHE_MODE=local_window python examples/cache_probe.py \
+  --model gemma4_e4b --cache-length 16384
+```
+
+Trace bundles for the v5e-4, v5e-8, and v5e-16 runs (per-case
+service-latency JSONs, per-chip HBM samples, sharding reports) are
+preserved out-of-tree.
+
+---
+
+## 11. What this is not
+
+To save reviewer time, this change is not:
+
+- **PagedAttention.** No block tables, no Pallas gather kernels, no
+  ragged attention. The eager-buffer approach with a per-layer
+  ring-buffer is sufficient for batch=1 research-and-evaluation
+  inference and is what fits cleanly into the existing sampler.
+- **A cache-sharding refactor.** The default Gemma 4 cache placement
+  is unchanged. The branch does expose a partition spec when a mesh
+  is available, which lets a caller shard cache K/V on the head axis
+  when divisible, but cache sharding policy is the caller's choice and
+  is not load-bearing for the local-window claim.
+- **A general sliding-window mechanism.** The plumbing is specific to
+  `gemma4`. The pattern would port to `gemma3n` with a small change,
+  and conceptually to Longformer/Mistral-style architectures, but
+  this branch does not attempt that.
+- **A quantization change.** The K/V dtype is unchanged.
+- **A multi-tenant serving optimization.** The cost characterization
+  applies to single-request decode. Heterogeneous-length batch
+  serving has different tradeoffs that this branch does not address.
