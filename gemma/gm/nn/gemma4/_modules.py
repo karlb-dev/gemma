@@ -253,6 +253,7 @@ class Attention(nn.Module):
       cache: LayerCache | None,
       attn_mask: jax.Array,
       kv_shared_cache: LayerCache | None = None,
+      skip_sliding_mask: bool = False,
   ) -> tuple[LayerCache | None, jax.Array]:
     """Applies multi-head attention to the inputs.
 
@@ -262,6 +263,7 @@ class Attention(nn.Module):
       cache: KV cache or None.
       attn_mask: Attention mask of shape [batch_size, seq_len, cache_size].
       kv_shared_cache: Cache for shared KV layers.
+      skip_sliding_mask: If True, skip the sliding mask.
 
     Returns:
       cache: Updated attention KV cache.
@@ -403,7 +405,7 @@ class Attention(nn.Module):
       logits = jnp.tanh(logits / self.attn_logits_soft_cap)
       logits = logits * self.attn_logits_soft_cap
 
-    if self.attn_type == AttentionType.LOCAL_SLIDING:
+    if self.attn_type == AttentionType.LOCAL_SLIDING and not skip_sliding_mask:
       if self.sliding_window_size is None:
         raise ValueError(
             'Sliding_window_size must be set if Local Sliding attention type'
@@ -736,6 +738,7 @@ class Block(nn.Module):
       attn_mask: jax.Array,
       per_layer_input: jax.Array | None = None,
       kv_shared_cache: LayerCache | None = None,
+      skip_sliding_mask: bool = False,
   ) -> tuple[LayerCache | None, jax.Array]:
     """Applies the block to the inputs.
 
@@ -747,6 +750,7 @@ class Block(nn.Module):
       per_layer_input: Per-layer input of shape [batch_size, seq_len,
         per_layer_input_dim].
       kv_shared_cache: Cache for shared KV layers.
+      skip_sliding_mask: If True, skip the sliding mask.
 
     Returns:
       cache: Updated attention KV cache.
@@ -761,6 +765,7 @@ class Block(nn.Module):
         cache,
         attn_mask,
         kv_shared_cache,
+        skip_sliding_mask=skip_sliding_mask,
     )
 
     if self.post_attention_norm is not None:
@@ -816,7 +821,7 @@ class Block(nn.Module):
 
     # MoE branch (mlp in checkpoint)
     moe_in = self.pre_ffw_norm(attn_output)
-    moe_out = self.mlp(moe_in)
+    moe_out = self.mlp(moe_in, unnormalized_x=attn_output)  # pytype: disable=wrong-keyword-args
     if self.post_ffw1_norm is not None:
       moe_out = self.post_ffw1_norm(moe_out)
 
