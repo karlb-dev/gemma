@@ -68,9 +68,11 @@ class CheckpointPath(enum.StrEnum):
   GEMMA4_E2B_PT = 'gs://gemma-data/checkpoints/gemma4-e2b-pt'
   GEMMA4_E4B_PT = 'gs://gemma-data/checkpoints/gemma4-e4b-pt'
   GEMMA4_26B_A4B_PT = 'gs://gemma-data/checkpoints/gemma4-26b-a4b-pt'
+  GEMMA4_12B_PT = 'gs://gemma-data/checkpoints/gemma4-12b-pt'
   GEMMA4_31B_PT = 'gs://gemma-data/checkpoints/gemma4-31b-pt'
   # Instruction Tuned
   GEMMA4_E2B_IT = 'gs://gemma-data/checkpoints/gemma4-e2b-it'
   GEMMA4_E4B_IT = 'gs://gemma-data/checkpoints/gemma4-e4b-it'
   GEMMA4_26B_A4B_IT = 'gs://gemma-data/checkpoints/gemma4-26b-a4b-it'
+  GEMMA4_12B_IT = 'gs://gemma-data/checkpoints/gemma4-12b-it'
   GEMMA4_31B_IT = 'gs://gemma-data/checkpoints/gemma4-31b-it'

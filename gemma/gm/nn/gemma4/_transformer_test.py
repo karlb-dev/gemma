@@ -60,6 +60,7 @@ def _get_output(
         gemma4_models.Gemma4_E2B,
         gemma4_models.Gemma4_E4B,
         gemma4_models.Gemma4_31B,
+        gemma4_models.Gemma4_12B,
     ],
 )
 def test_transformer(model_cls: type[gt.Transformer]):
@@ -233,6 +234,26 @@ def test_e4b_tp2_cache_partition_specs_shard_all_kv(monkeypatch):
       for name in ('k', 'v')
   }
   assert kv_specs == {(None, None, 'tensor', None)}
+
+
+def test_12b_config_matches_public_model_card():
+  model = gemma4_models.Gemma4_12B()  # pylint: disable=missing-kwoa  # pytype: disable=missing-parameter
+  config = model.config
+
+  assert config.num_layers == 48
+  assert config.embed_dim == 3840
+  assert config.hidden_dim == 15360
+  assert config.num_heads == 16
+  assert config.num_kv_heads == 8
+  assert config.num_global_kv_heads == 1
+  assert config.sliding_window_size == 1024
+  assert config.global_key_size == 512
+  assert config.k_eq_v_global
+  assert config.use_bidirectional_attention is None
+  assert config.audio_encoder is None
+  assert config.vision_encoder is None
+  assert config.attention_types[-1] == _modules.AttentionType.GLOBAL
+  assert config.attention_types.count(_modules.AttentionType.GLOBAL) == 8
 
 
 def test_cache_partition_spec_replicates_without_tensor_axis(monkeypatch):

@@ -28,6 +28,7 @@ from gemma.gm.nn.gemma4.vision import _encoder as gemma_vision
 _NUM_LAYERS_GEMMA4_E2B = 35
 _NUM_LAYERS_GEMMA4_E4B = 42
 _NUM_LAYERS_GEMMA4_31B = 60
+_NUM_LAYERS_GEMMA4_12B = 48
 _NUM_LAYERS_GEMMA4_26B_A4B_MOE = 30
 _DEFAULT_GLOBAL_KEY_SIZE = 512
 _FFW_HIDDEN_RATIO = 4
@@ -228,6 +229,46 @@ class Gemma4_31B(_Gemma4Base):  # pylint: disable=invalid-name
           standardize_embeddings=True,
       ),
       use_bidirectional_attention='vision',
+  )
+
+  INFO = _transformer.ModelInfo(
+      tokenizer_version=4,
+  )
+
+
+class Gemma4_12B(_Gemma4Base):  # pylint: disable=invalid-name
+  """Gemma 4 12B text decoder.
+
+  This mirrors the public Transformers config for google/gemma-4-12B(-it):
+  a dense 48-layer Gemma 4 model with 3840 hidden size, 16 attention heads,
+  8 local KV heads, 1 global KV head, 1024-token sliding attention windows,
+  and 256K token context. Multimodal unified input is not implemented here.
+  """
+
+  attention_pattern = (
+      _modules.AttentionType.LOCAL_SLIDING,
+      _modules.AttentionType.LOCAL_SLIDING,
+      _modules.AttentionType.LOCAL_SLIDING,
+      _modules.AttentionType.LOCAL_SLIDING,
+      _modules.AttentionType.LOCAL_SLIDING,
+      _modules.AttentionType.GLOBAL,
+  )
+  global_local_pattern = _config.make_attention_layers_types(
+      attention_pattern, num_layers=_NUM_LAYERS_GEMMA4_12B
+  )
+  config: _config.TransformerConfig = _gemma4_config(
+      embed_dim=3840,
+      num_heads=16,
+      num_kv_heads=8,
+      num_global_kv_heads=1,
+      per_layer_input_dim=0,
+      frac_shared_layers=0.0,
+      attention_types=global_local_pattern,
+      sliding_window_size=1024,
+      k_eq_v_global=True,
+      use_post_attn_norm=True,
+      use_post_ffw_norm=True,
+      override_ffw_hidden_for_kv_cache_sharing=False,
   )
 
   INFO = _transformer.ModelInfo(
