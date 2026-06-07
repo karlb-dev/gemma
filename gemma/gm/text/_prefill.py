@@ -637,6 +637,13 @@ def _compact_local_window_layer(
       prefill_layer['positions'], safe_selected_logical, axis=1
   ).astype(jnp.int32)
 
+  # Precondition: the W selected positions are distinct mod W. This holds for
+  # any single contiguous turn because the retained tokens are W consecutive
+  # logical positions, so `selected_pos` is W consecutive integers. If a future
+  # caller produced selected positions with a gap >= W (e.g. a non-contiguous
+  # multi-turn merge), two could collide on the same `dst_phys` slot and the
+  # `argmax` below would silently keep one and drop the other. Callers that can
+  # violate contiguity must compact those positions before reaching here.
   dst_phys = selected_pos % W
   slots = jnp.arange(W, dtype=jnp.int32)
   matches = (dst_phys[:, :, None] == slots[None, None, :])
